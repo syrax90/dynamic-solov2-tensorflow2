@@ -1,0 +1,27 @@
+# Virtualenv
+/.venv/
+/venv/
+
+.idea/
+.vscode/
+.data/
+.weights/
+.debug/
+.temp/
+.images/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+.ipynb_checkpoints/
+
+images/*
+images/test/*
+weights/*
+/archives/
+
+# exceptions
+!images/readme
+!images/test
+
+
+
