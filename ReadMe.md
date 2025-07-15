@@ -11,11 +11,11 @@ SOLO (Segmenting Objects by Locations) is a model designed for computer vision t
 
 To understand instance segmentation better, consider the example below, where multiple objects—whether of the same or different classes—are identified as separate instances, each with its own segmentation mask (and the probability of belonging to a certain class):   
 
-![Instance segmentation picture](images/readme/instance_segmentation.png)  
+![Instance segmentation picture](images/readme/my_photo_with_masks.png)  
 
 This project implements the <strong>Dynamic SOLO (SOLOv2)</strong> variant:  
 
-![Dynanic SOLO plot](images/readme/dynamic_solo_plot.png)
+![Dynanic SOLO plot](images/readme/dynamic_solo_plot_my_photo.png)
 
 ## Who This Project is For
 
