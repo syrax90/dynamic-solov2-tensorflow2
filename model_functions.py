@@ -26,7 +26,7 @@ def build_fpn_resnet50(input_shape=(224, 224, 3), ouput_kernels_number=256):
             of feature maps [p2, p3, p4, p5] from different FPN levels.
     """
     # Load the ResNet50 model without the top classification layer
-    backbone = ResNet50(include_top=False, input_shape=input_shape)
+    backbone = ResNet50(weights='imagenet', include_top=False, input_shape=input_shape)
     backbone.trainable = True
 
     # Define the layers to extract features from
@@ -158,6 +158,7 @@ class MaskFeatureFusion(tf.keras.layers.Layer):
         self.conv_P3 = make_conv_block()
         self.conv_P2 = make_conv_block()
         # Convs after merging each level
+        self.merge_conv_P5 = ConvGNReLU(out_channels, kernel_size=3, groups=groups)
         self.merge_conv_P4 = ConvGNReLU(out_channels, kernel_size=3, groups=groups)
         self.merge_conv_P3 = ConvGNReLU(out_channels, kernel_size=3, groups=groups)
         self.merge_conv_P2 = ConvGNReLU(out_channels, kernel_size=3, groups=groups)
@@ -169,7 +170,8 @@ class MaskFeatureFusion(tf.keras.layers.Layer):
         if self.use_coord_conv:
             P5 = append_coord_channels(P5)
         # Process P5 and upsample to P4's size
-        P5_upsampled = tf.image.resize(self.conv_P5(P5, training=training), size=tf.shape(P4)[1:3], method='bilinear')
+        P5_merged = self.merge_conv_P5(self.conv_P5(P5, training=training), training=training)
+        P5_upsampled = tf.image.resize(P5_merged, size=tf.shape(P4)[1:3], method='bilinear')
         # Add to P4, then refine and upsample to P3's size
         P4_merged = self.merge_conv_P4(self.conv_P4(P4, training=training) + P5_upsampled, training=training)
         P4_upsampled = tf.image.resize(P4_merged, size=tf.shape(P3)[1:3], method='bilinear')
@@ -240,7 +242,7 @@ class DynamicSOLOHead(tf.keras.layers.Layer):
                 ], name=f'{name}_cls_block_{i}')
             )
 
-        self.cls_logits = tf.keras.layers.Conv2D(num_classes, kernel_size=1, padding='same', name=f'{name}_cls_logits')
+        self.cls_logits = tf.keras.layers.Conv2D(self.num_classes, kernel_size=1, padding='same', name=f'{name}_cls_logits')
 
         # ----------------------------------------------------------------------
         # Mask branch
@@ -305,7 +307,7 @@ class SOLOModel(tf.keras.Model):
         input_shape=(None, None, 3),
         num_classes=80,
         grid_sizes=[40, 36, 24, 16],
-        num_stacked_convs=1,
+        num_stacked_convs=7,
         head_input_channels=256,
         mask_kernel_channels=256,
         **kwargs
@@ -324,7 +326,7 @@ class SOLOModel(tf.keras.Model):
         """
         super().__init__(**kwargs)
 
-        self.num_classes = num_classes
+        self.num_classes = num_classes + 1  # +1 for background class
         self.num_scales = len(grid_sizes)
 
         # Build FPN-ResNet backbone
@@ -334,7 +336,7 @@ class SOLOModel(tf.keras.Model):
         self.solo_heads = []
         for i in range(self.num_scales):
             head = DynamicSOLOHead(
-                num_classes=num_classes,
+                num_classes=self.num_classes,
                 grid_size=grid_sizes[i],
                 num_stacked_convs=num_stacked_convs,
                 mask_kernel_channels=mask_kernel_channels,
@@ -356,10 +358,13 @@ class SOLOModel(tf.keras.Model):
         # SOLO Head on each FPN scale
         for i, fpn_output in enumerate(fpn_outputs):
             class_out, mask_out = self.solo_heads[i](fpn_output, training=training)
-            class_outputs.append(class_out)
-            mask_outputs.append(mask_out)
+            class_outputs.append(tf.reshape(class_out, [-1, tf.shape(class_out)[1] * tf.shape(class_out)[2], tf.shape(class_out)[3]]))
+            mask_outputs.append(tf.reshape(mask_out, [-1, tf.shape(mask_out)[1] * tf.shape(mask_out)[2], tf.shape(mask_out)[3]]))
+
+        class_outputs = tf.concat(class_outputs, axis=1)  # [B, sum(S_i*S_i), num_classes]
+        mask_outputs = tf.concat(mask_outputs, axis=1)  # [B, sum(S_i*S_i), E]
 
         # Mask feature branch
         mask_feat = self.mask_feat_branch(fpn_outputs, training=training)
 
-        return (class_outputs, mask_outputs, mask_feat)
+        return class_outputs, mask_outputs, mask_feat

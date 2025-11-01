@@ -5,129 +5,146 @@ Description: This script draws dataset with masks by categories to understand wh
 """
 
 
-import cv2
 import os
-import numpy as np
-import tensorflow as tf
 from pycocotools.coco import COCO
+import tensorflow as tf
+import numpy as np
+import cv2
+import random
 
 from config import DynamicSOLOConfig
-from coco_dataset import create_coco_tf_dataset, get_classes
+from coco_dataset import create_coco_tf_dataset
+from coco_dataset_optimized import create_coco_tfrecord_dataset
 import shutil
 
-
-def save_masks_by_category(
-        image_tensor,
-        ms_targets,
-        category_names,
-        img_num,
-        out_dir="masks_output"
+def draw_solo_instances(
+    image,                 # tf.Tensor or np.ndarray, HxWx3, RGB, [0,1] or [0,255]
+    cate_target,           # tf.Tensor or np.ndarray, shape [sum(S_i^2)], int32, -1 for empty else category_id
+    mask_target,           # tf.Tensor or np.ndarray, shape [Hf, Wf, sum(S_i^2)], uint8 {0,1}
+    class_names=None,      # dict {category_id: "name"} (same role as in your snippet)
+    show_labels=True       # follow your snippet's switch
 ):
     """
-    For each scale in `ms_targets`, separate the mask channels by category and
-    save the results to disk in a folder structure like:
-        masks_output/
-          catName_0/
-            scale0_channel0.png
-            scale0_channel5.png
-            ...
-          catName_1/
-            scale1_channel3.png
-            ...
+    Returns a BGR uint8 visualization with colored masks and optional class labels.
+    Coloring, transparency and blending follow the behavior in draw_solo_masks():
+      - random color per instance
+      - alpha = 0.5
+      - vis[mask==1] = alpha*color + (1-alpha)*vis[mask==1]
+      - label near the first pixel of the mask
+    """
+
+    # --- to numpy ---
+    if isinstance(image, tf.Tensor):       image = image.numpy()
+    if isinstance(cate_target, tf.Tensor): cate_target = cate_target.numpy()
+    if isinstance(mask_target, tf.Tensor): mask_target = mask_target.numpy()
+
+    # --- image to uint8 BGR (so cv2.imwrite works as expected) ---
+    img = image.copy()
+    if img.dtype != np.uint8:
+        img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
+    vis = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+    H, W = vis.shape[:2]
+    Hf, Wf, C = mask_target.shape
+    assert C == cate_target.shape[0], "mask_target channels and cate_target length must match"
+
+    # Upsample all masks to image size using NEAREST (binary kept)
+    if (Hf != H) or (Wf != W):
+        up_masks = np.zeros((H, W, C), dtype=np.uint8)
+        for c in range(C):
+            up_masks[..., c] = cv2.resize(mask_target[..., c], (W, H), interpolation=cv2.INTER_NEAREST)
+    else:
+        up_masks = mask_target
+
+    # positive channels (instances)
+    pos_idx = np.where(cate_target >= 0)[0]
+    if pos_idx.size == 0:
+        return vis
+
+    alpha = 0.5
+
+    for ch in pos_idx:
+        class_id = int(cate_target[ch])
+        mask_bin = (up_masks[..., ch] > 0)
+
+        if mask_bin.sum() == 0:
+            continue
+
+        # Random color per instance (same principle as your snippet)
+        color = np.array([random.randint(0, 255) for _ in range(3)], dtype=np.float32)
+
+        # Per-pixel alpha blend exactly like:
+        # vis[mask==1] = alpha*color + (1-alpha)*vis[mask==1]
+        m = mask_bin
+        if m.any():
+            region = vis[m].astype(np.float32)
+            vis[m] = (alpha * color + (1.0 - alpha) * region).astype(np.uint8)
+
+        # Label near first pixel in the mask (if enabled)
+        if show_labels:
+            ys, xs = np.where(m)
+            if len(ys) > 0:
+                y0, x0 = int(ys[0]), int(xs[0])
+                if isinstance(class_names, dict) and (class_id in class_names):
+                    label_str = f"{class_names.get(class_id)}"
+                else:
+                    label_str = f"ID={class_id}"
+                cv2.putText(
+                    vis, label_str,
+                    (x0, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (255, 255, 255), 1
+                )
+
+    return vis
+
+def save_dataset_preview(dataset, coco_classes, out_dir, max_images=50, show_labels=True):
+    """
+    Save a grid-free preview of SOLO targets for a dataset.
+
+    Iterates over a `tf.data.Dataset` that yields `(images, cate_targets, mask_targets)`
+    batches, renders each sample with `draw_solo_instances`, and writes PNG files to
+    `out_dir` until `max_images` previews are saved.
 
     Args:
-        image_tensor (tf.Tensor): shape=(H, W, 3), in [0,1].
-        ms_targets (dict): e.g. contains "cate_target_0", "mask_target_0", etc.
-        category_names(dict):
-                       a dict mapping category_id -> readable category name.
-        out_dir (str): root directory to save mask images.
+      dataset: `tf.data.Dataset` where each batch is a tuple:
+        - images: Tensor of shape (B, H, W, 3), RGB, float in [0,1] or uint8.
+        - cate_targets: Tensor of shape (B, C), int32; -1 for empty, category_id otherwise.
+        - mask_targets: Tensor of shape (B, Hf, Wf, C), uint8 {0,1}.
+      coco_classes: `dict[int, str]` mapping category_id → class name for labeling.
+      out_dir: Destination directory to store rendered PNG files.
+      max_images: Maximum number of samples to save across all batches.
+      show_labels: If True, overlay class labels on the previews.
+
+    Returns:
+      None
     """
-    # Make sure the output directory exists
+    import os, cv2
     os.makedirs(out_dir, exist_ok=True)
-
-    # Convert image to Numpy
-    image_np = image_tensor.numpy()  # shape=(H, W, 3)
-    img_h, img_w = image_np.shape[:2]
-
-    # Figure out the scale indices from ms_targets
-    scale_indices = []
-    for key in ms_targets.keys():
-        if key.startswith("mask_target_"):
-            idx = int(key.split("_")[-1])
-            scale_indices.append(idx)
-    scale_indices.sort()
-
-    # Loop over scales
-    for scale_idx in scale_indices:
-        cate_key = f"cate_target_{scale_idx}"
-        mask_key = f"mask_target_{scale_idx}"
-
-        cate_tensor = ms_targets[cate_key]  # shape=(grid_size, grid_size)
-        mask_tensor = ms_targets[mask_key]  # shape=(feat_h, feat_w, grid_size^2)
-
-        cate_np = cate_tensor[0].numpy()
-        mask_np = mask_tensor[0].numpy()
-
-        feat_h, feat_w, num_channels = mask_np.shape
-        grid_size = cate_np.shape[0]  # e.g. 40, 36, etc.
-
-        # Sanity check: grid_size^2 should match num_channels
-        assert grid_size * grid_size == num_channels, \
-            f"Mismatch: grid_size^2={grid_size * grid_size} vs mask channels={num_channels}"
-
-        # Iterate over each channel in mask_target
-        for ch in range(num_channels):
-            # Derive the grid cell (gy, gx) from channel index
-            gy = ch // grid_size
-            gx = ch % grid_size
-
-            cat_id = cate_np[gy, gx]
-            if cat_id == -1:
-                # No object in this cell
-                continue
-
-            # Get the mask for this channel
-            mask_ch = mask_np[..., ch]  # shape=(feat_h, feat_w)
-
-            # If the mask is all zeros, skip to avoid extra blank images
-            if np.max(mask_ch) == 0:
-                continue
-
-            # Resize mask to match the original (H, W)
-            # We use INTER_NEAREST to preserve the hard edges
-            mask_resized = cv2.resize(
-                mask_ch.astype(np.uint8),
-                (img_w, img_h),
-                interpolation=cv2.INTER_NEAREST
+    saved = 0
+    for batch in dataset:
+        images, cate_targets, mask_targets = batch
+        bs = images.shape[0]
+        for b in range(bs):
+            vis = draw_solo_instances(
+                images[b].numpy(),
+                cate_targets[b].numpy(),
+                mask_targets[b].numpy(),
+                class_names=coco_classes,
+                show_labels=show_labels
             )
+            cv2.imwrite(os.path.join(out_dir, f"sample_{saved:04d}.png"), vis)
+            saved += 1
+            if saved >= max_images:
+                return
 
-            # Prepare an overlay or just the masked region
-            # Here we show an example overlay in red
-            overlay_color = (1.0, 0.0, 0.0)  # Red in [0,1]
-            overlay = image_np.copy()
-
-            # Make a colored overlay wherever mask==1
-            # If you prefer pure mask, skip the overlay logic
-            overlay[mask_resized > 0] = overlay_color
-
-            # Convert overlay to 8-bit
-            overlay_8u = (overlay * 255).astype(np.uint8)
-
-            # Create category folder
-            # If you have a dict or list of category_names, do something like:
-            cat_name = category_names.get(cat_id) if cat_id < len(category_names) else f"cat_{cat_id}"
-            cat_dir = os.path.join(out_dir, cat_name)
-            os.makedirs(cat_dir, exist_ok=True)
-
-            # Construct a filename
-            # Example: scale0_channel12.png
-            out_filename = f"img_{img_num}_scale{scale_idx}_channel{ch}.png"
-            out_path = os.path.join(cat_dir, out_filename)
-
-            # Save to disk
-            cv2.imwrite(out_path, cv2.cvtColor(overlay_8u, cv2.COLOR_RGB2BGR))
-
-    print(f"Masks saved under '{out_dir}' separated by category.")
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, False)
+    except RuntimeError as e:
+        print(e)
 
 if __name__ == '__main__':
     cfg = DynamicSOLOConfig()
@@ -139,22 +156,33 @@ if __name__ == '__main__':
     num_classes = len(coco_classes)
     img_height, img_width = cfg.img_height, cfg.img_width
 
-    ds = create_coco_tf_dataset(
-        coco_annotation_file=cfg.train_annotation_path,
-        coco_img_dir=cfg.images_path,
-        num_classes=num_classes,
-        target_size=(img_height, img_width),
-        batch_size=1,
-        grid_sizes=cfg.grid_sizes,
-        scale=cfg.image_scales[0],
-        augment=False,
-        number_images=20
-    )
+    if cfg.use_optimized_dataset:
+        ds = create_coco_tfrecord_dataset(
+            train_tfrecord_directory=cfg.tfrecord_dataset_directory_path,
+            target_size=(img_height, img_width),
+            batch_size=cfg.batch_size,
+            grid_sizes=cfg.grid_sizes,
+            scale=cfg.image_scales[0],
+            augment=cfg.augment,
+            shuffle_buffer_size=cfg.shuffle_buffer_size,
+            number_images=cfg.number_images)
+    else:
+        ds = create_coco_tf_dataset(
+            coco_annotation_file=cfg.train_annotation_path,
+            coco_img_dir=cfg.images_path,
+            target_size=(img_height, img_width),
+            batch_size=cfg.batch_size,
+            grid_sizes=cfg.grid_sizes,
+            scale=cfg.image_scales[0],
+            augment=False,
+            number_images=cfg.number_images
+        )
 
     out_dir = 'images/dataset_test'
     shutil.rmtree(out_dir, ignore_errors=True)
 
-    for img_num, (image_tensor, ms_targets) in enumerate(ds):
-        save_masks_by_category(image_tensor[0], ms_targets, category_names=coco_classes, img_num=img_num, out_dir=out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    save_dataset_preview(ds, coco_classes, out_dir, max_images=200)  # adjust as needed
+    print(f"Saved previews to: {out_dir}")
 
 

@@ -132,9 +132,9 @@ def generate_solo_targets_single_scale(
         center_radius (int): how many grid cells around the center to assign
 
     Returns:
-        cate_target_tf (tf.Tensor): shape=(grid_size, grid_size),
+        cate_target_tf (tf.Tensor): shape=[grid_size, grid_size] or [S_i, S_i],
                                  storing class IDs or -1 if no object
-        mask_target_tf (tf.Tensor): shape=(feat_shape, feat_shape, grid_size^2),
+        mask_target_tf (tf.Tensor): shape=[feat_shape, feat_shape, grid_size^2] or [H, W, S_i*S_i],
                                  storing binary masks for each cell/channel.
     """
     img_h, img_w = img_shape
@@ -229,7 +229,7 @@ def generate_solo_targets_multi_scale(
     Generates classification and mask targets for multiple feature map scales.
 
     For each scale in `grid_sizes`, this function calls `generate_solo_targets_single_scale`
-    to produce category and mask targets. These are organized into a dictionary keyed by scale index.
+    to produce category and mask targets. The results from all scales are then concatenated.
 
     Args:
         anns (list): Each item is a dict with:
@@ -242,11 +242,13 @@ def generate_solo_targets_multi_scale(
         scale_ranges (List[Tuple[float, float]]): List of (lower, upper) scale bounds for each grid level.
 
     Returns:
-        Dict[str, tf.Tensor]: A dictionary containing classification and mask targets for each scale level.
-        Keys follow the format "cate_target_i" and "mask_target_i" where i is the scale index.
+        Tuple[tf.Tensor, tf.Tensor]:
+            - cate_targets (tf.Tensor): Concatenated classification targets of shape [sum(S_i * S_i),].
+            - mask_targets (tf.Tensor): Concatenated mask targets of shape [H, W, sum(S_i * S_i)].
     """
 
-    ms_targets = {}
+    cate_targets = []
+    mask_targets = []
 
     for i, gs in enumerate(grid_sizes):
         cate_t, mask_t = generate_solo_targets_single_scale(
@@ -259,9 +261,12 @@ def generate_solo_targets_multi_scale(
             scale_range=scale_ranges[i],
             center_radius=0
         )
-        ms_targets[f"cate_target_{i}"] = cate_t
-        ms_targets[f"mask_target_{i}"] = mask_t
-    return ms_targets
+        cate_targets.append(tf.reshape(cate_t, [tf.shape(cate_t)[0] * tf.shape(cate_t)[1]]))
+        mask_targets.append(mask_t)
+
+    cate_targets = tf.concat(cate_targets, axis=0)  # [sum(S_i*S_i),]
+    mask_targets = tf.concat(mask_targets, axis=2)  # [H, W, sum(S_i*S_i)]
+    return cate_targets, mask_targets
 
 
 class CocoGenerator:
@@ -285,7 +290,6 @@ class CocoGenerator:
     def __init__(self, coco, coco_img_dir,
         grid_sizes=[40, 36, 24, 16],
         scale=0.25,
-        num_classes=80,
         target_size=(320, 320),
         shuffle=True,
         augment=True,
@@ -295,7 +299,6 @@ class CocoGenerator:
         self._coco_img_dir = coco_img_dir
         self._grid_sizes = grid_sizes
         self._scale = scale
-        self._num_classes = num_classes
         self._target_size = target_size
         self._shuffle = shuffle
         self._augment = augment
@@ -313,9 +316,10 @@ class CocoGenerator:
             4. Generates classification and mask targets for multiple scales.
 
         Yields:
-            Tuple[tf.Tensor, Dict[str, tf.Tensor]]: A tuple where the first element is the resized image
-            as a TensorFlow tensor, and the second element is a dictionary of targets
-            with keys like "cate_target_0", "mask_target_0", ..., for each scale level.
+            Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+                - image_tensor (tf.Tensor): Resized image as a float32 tensor of shape [H, W, 3], with pixel values in [0, 1].
+                - cate_targets (tf.Tensor): Concatenated classification targets of shape [sum(S_i * S_i),].
+                - mask_targets (tf.Tensor): Concatenated mask targets of shape [H, W, sum(S_i * S_i)].
         """
         if self._shuffle:
             random.shuffle(self._image_ids)
@@ -379,7 +383,7 @@ class CocoGenerator:
 
 
             # Generate multi-scale SOLO targets
-            ms_targets = generate_solo_targets_multi_scale(
+            cate_targets, mask_targets = generate_solo_targets_multi_scale(
                 anns,
                 resized_masks,
                 resized_bboxes,
@@ -389,16 +393,10 @@ class CocoGenerator:
                 scale_ranges=self._scale_ranges
             )
 
-            '''
-            for ann in anns:
-                ann.clear()
-            del anns, masks
-            '''
-
             image_tensor = tf.convert_to_tensor(image_tensor)
 
             # Yield
-            yield image_tensor, ms_targets
+            yield image_tensor, cate_targets, mask_targets
 
     def _apply_augmentations(self, image, anns, masks):
         """
@@ -483,7 +481,6 @@ def create_coco_tf_dataset(
         coco_annotation_file, coco_img_dir,
         grid_sizes=[40, 36, 24, 16],
         scale=0.25,
-        num_classes=80,
         target_size=(320, 320),
         batch_size=2,
         shuffle=True,
@@ -502,7 +499,6 @@ def create_coco_tf_dataset(
         coco_img_dir (str): Directory containing the corresponding COCO images.
         grid_sizes (List[int], optional): List of grid sizes corresponding to different feature levels. Defaults to [40, 36, 24, 16].
         scale (float, optional): Downsampling scale factor from image to feature map resolution. Defaults to 0.25. Based on P2 FPN level
-        num_classes (int, optional): Number of object categories. Defaults to 80.
         target_size (Tuple[int, int], optional): Desired (height, width) to resize all images and masks to. Defaults to (320, 320).
         batch_size (int, optional): Number of samples per batch. Defaults to 2.
         shuffle (bool, optional): Whether to shuffle the dataset before generating batches. Defaults to True.
@@ -510,15 +506,14 @@ def create_coco_tf_dataset(
         number_images (int): Number of images per generation. Use all images if the parameter set to None
 
     Returns:
-        tf.data.Dataset: A TensorFlow dataset yielding batches of (image_tensor, targets_dict), where:
-            - `image_tensor` is a float32 tensor of shape (batch_size, target_height, target_width, 3).
-            - `targets_dict` is a dictionary containing:
-                - "cate_target_i": int32 tensor of shape (batch_size, grid_size, grid_size).
-                - "mask_target_i": uint8 tensor of shape (batch_size, scaled_height, scaled_width, grid_size), for each level i.
+        tf.data.Dataset: A dataset yielding batched tuples
+            (images, cate_target, mask_target) with dtypes and shapes:
 
-    Notes:
-        - Due to different `grid_sizes`, the output shapes for masks vary across scales.
-        - Prefetching is used to improve pipeline performance.
+            - images: tf.float32, shape [batch_size, H, W, 3],
+              where H, W = target_size.
+            - cate_target: tf.int32, shape [batch_size, sum(S_i * S_i)].
+            - mask_target: tf.uint8, shape [batch_size, H, W, sum(S_i * S_i)].
+              where S_i are the grid sizes in `grid_sizes`.
     """
     coco = COCO(coco_annotation_file)
 
@@ -526,7 +521,6 @@ def create_coco_tf_dataset(
             coco, coco_img_dir,
             grid_sizes=grid_sizes,
             scale=scale,
-            num_classes=num_classes,
             target_size=target_size,
             shuffle=shuffle,
             augment=augment,
@@ -534,28 +528,11 @@ def create_coco_tf_dataset(
         )
 
     output_signature = (
-        tf.TensorSpec(shape=(target_size[0], target_size[1], 3), dtype=tf.float32),
-        {
-            **{
-                f"cate_target_{i}": tf.TensorSpec(
-                    shape=(grid_sizes[i], grid_sizes[i]), dtype=tf.int32
-                )
-                for i in range(len(grid_sizes))
-            },
-            **{
-                f"mask_target_{i}": tf.TensorSpec(
-                    shape=(
-                        int(round(target_size[0] * scale)),
-                        int(round(target_size[1] * scale)),
-                        grid_sizes[i] ** 2,
-                    ),
-                    dtype=tf.uint8,
-                )
-                for i in range(len(grid_sizes))
-            }
-        }
+        tf.TensorSpec(shape=(target_size[0], target_size[1], 3), dtype=tf.float32, name="images"),
+        tf.TensorSpec(shape=(sum(x**2 for x in grid_sizes),), dtype=tf.int32, name="cate_target"),
+        tf.TensorSpec(shape=(int(round(target_size[0] * scale)), int(round(target_size[1] * scale)), sum(x**2 for x in grid_sizes)),
+                      dtype=tf.uint8, name="mask_target"),
     )
-
 
     dataset = tf.data.Dataset.from_generator(
         coco_generator.generate,
