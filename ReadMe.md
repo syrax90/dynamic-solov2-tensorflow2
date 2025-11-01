@@ -19,15 +19,15 @@ This project implements the <strong>Dynamic SOLO (SOLOv2)</strong> variant:
 
 ## Who This Project is For
 
-This is <strong>not a production-ready</strong> project. It is primarily intended for educational purposes—especially for individuals without high-performance GPUs who are interested in learning about computer vision and the SOLO model. We chose TensorFlow to make the implementation accessible. The code is thoroughly documented to ensure clarity and ease of understanding.
+It is primarily intended for educational purposes—especially for individuals without high-performance GPUs who are interested in learning about computer vision and the SOLO model. We chose TensorFlow to make the implementation accessible. The code is thoroughly documented to ensure clarity and ease of understanding. However, the code is well optimized for use in production-ready tasks.
 
 ## Installation, Dependencies, and Requirements
 
-- Python 3.11 is required.
+- Python 3.12.3 is required.
 - All dependencies are listed in `requirements.txt`.
 - Use `setup.sh` to install all dependencies on Linux.
 
-The project has been tested on <strong>Ubuntu 24.04.2 LTS</strong> with <strong>TensorFlow 2.15.0.post1</strong>. It may work on other operating systems and TensorFlow versions (older than 2.15.0.post1), but we cannot guarantee compatibility.
+The project has been tested on <strong>Ubuntu 24.04.2 LTS</strong> with <strong>nvcr.io/nvidia/tensorflow:25.02-tf2-py3 container using TensorFlow 2.17.0</strong>. It may work on other operating systems and TensorFlow versions (older than 2.17.0), but we cannot guarantee compatibility.
 
 > <strong>Note:</strong> A GPU with CUDA support is highly recommended to speed up training. The project currently does not support multi-GPU training.
 
@@ -35,6 +35,21 @@ The project has been tested on <strong>Ubuntu 24.04.2 LTS</strong> with <strong>
 
 The code supports datasets in the COCO format. We recommend creating your own dataset to better understand the full training cycle, including data preparation. [LabelMe](https://github.com/wkentaro/labelme) is a good tool for this. You don’t need a large dataset or many classes to begin training and see results. This makes it easier to experiment and learn without requiring powerful hardware.  
 Alternatively, you can use the original [COCO dataset](https://cocodataset.org/#home), which contains 80 object categories.
+
+For high-performance tasks we recommend using the dataset generator from `coco_dataset_optimized.py`. The dataset interacts with TFRecord format files using parallel reading and compatible with TensorFlow Graph Mode. To use the dataset, follow these steps:
+1) Convert your COCO dataset to TFRecord files:
+```
+python convert_coco_to_tfrecord.py \
+  --images_root /path/to/images \
+  --annotations /path/to/instances_train.json \
+  --output /path/to/out/train.tfrecord \
+  --num_shards 4
+```
+2) Set corresponding settings in `config.py` file:
+```
+self.use_optimized_dataset = True
+self.tfrecord_dataset_directory_path = 'path/to/tfrecords/directory'
+```
 
 ## Configuration
 
@@ -134,7 +149,7 @@ It is possible to evaluate the data fed to the model before training to ensure t
 python test_dataset.py
 ```
 
-This script generates one image per instance (i.e., per object and its mask) categorized and scaled. The outputs are saved in `images/dataset_test`.
+This script generates images with instance masks and their corresponding category labels. The outputs are saved in `images/dataset_test`.
 
 By default, it processes the first 20 images. To change or remove this limit, edit `test_dataset.py`:
 

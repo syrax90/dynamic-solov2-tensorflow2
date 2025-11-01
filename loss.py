@@ -9,87 +9,103 @@ import tensorflow as tf
 
 
 def focal_loss(
-        logits,  # [B, H, W, num_classes]
-        targets,  # [B, H, W, num_classes]
-        alpha=0.25,
-        gamma=2.0
+        logits,   # [B, H, W, C]
+        targets,  # [B, H, W, C] one-hot
+        alpha=None,   # per-class weight for positives and negatives
+        gamma=2.0,
+        eps=1e-7
 ):
     """
-    Computes focal loss for multi-class classification. It expects 'targets' to be one-hot.
+    Softmax focal loss with explicit penalty for false positives (non-target classes).
 
     Args:
-        logits:   [B, H, W, C]
-        targets:  [B, H, W, C] one-hot
-        alpha:    weighting factor for positive samples
-        gamma:    exponent factor to down-weight easy examples
+        logits:  [B, H, W, C] unnormalized scores.
+        targets: [B, H, W, C] one-hot (exactly one 1 per pixel).
+        alpha:   per-class weighting for positives and negatives. If None, uses [0.001 for background, 0.75 for others].
+        gamma:   focusing parameter.
+        eps:     numerical stability for logs.
 
     Returns:
-        A scalar Tensor of shape [] (the mean loss).
+        Scalar Tensor (mean loss).
     """
-    # Typically we do logits => prob using sigmoid or softmax
-    # If it's purely multi-class with exactly 1 class active at each location,
-    # you might prefer softmax. Let's assume "sigmoid" multi-label style for simplicity:
-    probs = tf.nn.sigmoid(logits)  # shape [B, H, W, C]
+    num_classes = logits.shape[-1]
 
-    # The focal loss formula (for binary or multi-label) is:
-    # FL = - alpha * targets*(1 - probs)^gamma * log(probs)
-    #      - (1-alpha) * (1-targets)* probs^gamma * log(1 - probs)
-    pt = tf.where(tf.equal(targets, 1.), probs, 1. - probs)
-    focal_factor = alpha * tf.cast(tf.equal(targets, 1.), tf.float32) + \
-                   (1. - alpha) * tf.cast(tf.equal(targets, 0.), tf.float32)
-    focal_weight = focal_factor * tf.pow((1. - pt), gamma)
+    # Default alpha: emphasize foreground vs background
+    if alpha is None:
+        alpha = [0.001] + [0.75] * (num_classes - 1)
+    alpha = tf.constant(alpha, dtype=logits.dtype)  # [C]
+    alpha = tf.cast(alpha, logits.dtype)        # positives
 
-    # Cross-entropy part
-    ce_loss = tf.nn.sigmoid_cross_entropy_with_logits(labels=targets, logits=logits)
+    # Softmax probabilities
+    probs = tf.nn.softmax(logits, axis=-1)                 # [B,H,W,C]
+    probs = tf.clip_by_value(probs, eps, 1.0 - eps)
+    log_probs   = tf.math.log(probs)                       # [B,H,W,C]
+    log1m_probs = tf.math.log1p(-probs)                    # [B,H,W,C]
 
-    # Focal loss
-    loss = focal_weight * ce_loss
+    # Positive (true-class) focal term: -alpha * (1 - p)^gamma * log(p)
+    pos_weight = tf.pow(1.0 - probs, gamma)
+    pos_term = -targets * alpha * pos_weight * log_probs
 
+    # Negative (non-true-class) focal term (penalizes false positives):
+    # For each non-target class k: -alpha * p_k^gamma * log(1 - p_k)
+    neg_weight = tf.pow(probs, gamma)
+    neg_term = -(1.0 - targets) * alpha * neg_weight * log1m_probs
+
+    # Sum over classes, then mean over batch/spatial dims
+    loss = tf.reduce_sum(pos_term + neg_term, axis=-1)     # [B,H,W]
     return tf.reduce_mean(loss)
 
-def dice_loss(pred_mask, gt_mask, eps=1e-5):
+
+def dice_loss(pred_mask, gt_mask, cls_target, eps=1e-5):
     """
-    Computes a per-instance Dice Loss for a predicted mask vs. ground truth.
+    Computes per-instance Dice Loss for predicted vs. ground-truth masks,
+    considering only positive cells (as in SOLO).
 
     Args:
-        pred_mask:  [B, H, W, S] with probabilities in [0,1]
-        gt_mask:    [B, H, W, S] the same shape, with 0/1 ground-truth
+        pred_mask:  [B, H, W, S^2] with probabilities in [0,1]
+        gt_mask:    [B, H, W, S^2] the same shape, with 0/1 ground-truth
+        cls_target: [B, sum(S_i^2), num_classes] ground truth class labels (one-hot)
         eps:        small constant to avoid division by zero
 
     Returns:
-        Scalar dice loss (1 - dice_coefficient).
+        Scalar dice loss for positive cells.
     """
+    # Convert cls_target to positive mask [B, S^2]
+    # If it's one-hot, sum across classes → positive cell indicator
+    pos_mask = tf.reduce_sum(cls_target, axis=-1)  # [B, S, S]
+    pos_mask = tf.reshape(pos_mask, [tf.shape(pos_mask)[0], -1])  # [B, S^2]
 
-    intersection = tf.reduce_sum(pred_mask * gt_mask, axis=[1, 2])
-    union = tf.reduce_sum(tf.square(pred_mask), axis=[1, 2]) + tf.reduce_sum(tf.square(gt_mask), axis=[1, 2]) + eps
-    dice_coef = (2.0 * intersection + eps) / union
+    # Flatten masks for batch processing
+    pred_mask = tf.reshape(pred_mask, [tf.shape(pred_mask)[0], -1, tf.shape(pred_mask)[-1]])  # [B, HW, S^2]
+    gt_mask   = tf.reshape(gt_mask,   [tf.shape(gt_mask)[0], -1, tf.shape(gt_mask)[-1]])    # [B, HW, S^2]
+
+    # pos_mask: [B, S^2] {0,1} → bool
+    pos_bool = tf.cast(pos_mask > 0, tf.bool)  # [B, S^2]
+    HW = tf.shape(pred_mask)[1]
+
+    mask3 = tf.tile(pos_bool[:, tf.newaxis, :], [1, HW, 1])  # [B, HW, S]
+
+    pred_mask = tf.ragged.boolean_mask(pred_mask, mask3)
+    gt_mask = tf.ragged.boolean_mask(gt_mask, mask3)
+
+    # Compute intersection and union
+    intersection = tf.reduce_sum(pred_mask * gt_mask, axis=1)   # [B, S^2]
+    union = tf.reduce_sum(tf.square(pred_mask), axis=1) + tf.reduce_sum(tf.square(gt_mask), axis=1) + eps
+
+    dice_coef = (2.0 * intersection + eps) / union  # [B, S^2]
+
+    # Apply only positive cells
     dice_loss_value = 1.0 - dice_coef
+    dice_loss_value = tf.reduce_sum(dice_loss_value) / (tf.reduce_sum(pos_mask) + eps)
 
-    # We only want the loss for positive instances (where a ground-truth mask exists).
-    # Determine positive masks: a mask is positive if y_true has any foreground pixel.
-    # (Alternatively, one could use the classification labels to identify positives.)
-    pos_mask = tf.reduce_max(gt_mask, axis=[1, 2])  # shape [batch, S^2], 1.0 for any mask that has at least one pixel
-
-    # `pos_mask` will be 1.0 for positive instances, 0.0 for background instances.
-    # Multiply dice loss by pos_mask to ignore losses from negative (all-zero) masks.
-    masked_dice_loss = dice_loss_value * pos_mask
-
-    # Sum over all masks and batch
-    loss_sum = tf.reduce_sum(masked_dice_loss)
-
-    # Number of positive instances (masks) across the batch
-    num_pos = tf.reduce_sum(pos_mask)
-
-    # Average the dice loss only over positive instances
-    loss = loss_sum / tf.maximum(num_pos, 1.0)
-    return loss
+    return dice_loss_value
 
 
 def solo_loss(
-        cls_pred,  # [B, S, S, num_classes]
-        mask_pred,  # [B, H, W, S_i]
-        cls_target,  # [B, S, S, num_classes]
-        gt_masks_for_cells,  # [B, H, W, S_i]
+        cls_pred,  # [B, sum(S_i^2), num_classes]
+        mask_pred,  # [B, H, W, sum(S_i^2)]
+        cls_target,  # [B, sum(S_i^2), num_classes]
+        gt_masks_for_cells,  # [B, H, W, sum(S_i^2)]
         cls_loss_weight=1,
         mask_loss_weight=1,
 ):
@@ -97,12 +113,12 @@ def solo_loss(
     Computes the SOLO loss for a single scale, combining classification and mask prediction losses.
 
     Args:
-        cls_pred (Tensor): Predicted class scores with shape [B, S, S, num_classes],
-            where B is the batch size, S is the grid size, and num_classes is the number of classes.
-        mask_pred (Tensor): Predicted masks with shape [B, H, W, S_i],
+        cls_pred (Tensor): Predicted class scores with shape [B, sum(S_i^2), num_classes],
+            where `B` is the batch size, S_i is the grid size of corresponding FPN level, and num_classes is the number of classes.
+        mask_pred (Tensor): Predicted masks with shape [B, H, W, sum(S_i^2)],
             where H and W are spatial dimensions of P2 FPN level, and S_i corresponds to the number of masks per cell.
-        cls_target (Tensor): Ground truth class labels with shape [B, S, S, num_classes].
-        gt_masks_for_cells (Tensor): Ground truth masks aligned to cells with shape [B, H, W, S_i].
+        cls_target (Tensor): Ground truth class labels with shape [B, sum(S_i^2), num_classes].
+        gt_masks_for_cells (Tensor): Ground truth masks aligned to cells with shape [B, H, W, sum(S_i^2)].
         cls_loss_weight (int): regularization weight of classification loss.
         mask_loss_weight (int): regularization weight of mask prediction loss.
 
@@ -119,93 +135,75 @@ def solo_loss(
 
     # Compute dice loss for all masks in a vectorized way
     gt_masks_valid = tf.cast(gt_masks_for_cells, tf.float32)
-    mask_loss_value = dice_loss(mask_probs, gt_masks_valid)
+
+    cls_target_no_bg = cls_target[..., 1:]  # Exclude background class
+    mask_loss_value = dice_loss(mask_probs, gt_masks_valid, cls_target_no_bg)
 
     # Decrease mask_loss_value to train it faster
     total_loss = cls_loss_weight * cls_loss_value + mask_loss_weight * mask_loss_value
     return total_loss, cls_loss_value, mask_loss_value
 
 
-def compute_multiscale_loss(outputs, targets, num_scales, num_classes):
+def compute_multiscale_loss(class_outputs, mask_outputs, mask_feat, class_target, mask_target, num_classes):
     """
-    Computes SOLO loss for multiple scales (FPN levels)
+    Computes the total SOLO loss across multiple feature scales, combining classification and mask prediction losses.
+
+    This function integrates the classification (focal) loss and the mask (Dice) loss
+    for a given feature pyramid level. It prepares one-hot targets, reshapes feature maps,
+    computes mask predictions, and calls `solo_loss()` to compute the combined loss.
 
     Args:
-        outputs: list of outputs:
-            outputs[0]: list of categories tensors for each FPN level
-                outputs[0][0]: [B, S0, S0, num_classes] For P2 FPN level
-                ...
-                outputs[0][3]: [B, S3, S3, num_classes] For P5 FPN level
-            outputs[1]: list of kernel tensors for each FPN level
-                outputs[0][0]: [B, S0, S0, D] For P2 FPN level
-                ...
-                outputs[0][3]: [B, S3, S3, D] For P5 FPN level
-            outputs[2]: Mask feature tensor [B, H, W, D]    H and W equal to H and W for P2 FPN level
-
-        targets: dict with keys like:
-           "cate_target_0" -> shape [B, S0, S0] (integer labels, -1=ignore) For P2 FPN level
-           "mask_target_0" -> shape [B, H, W, S0]  H and W equal to H and W for P2 FPN level
-           ...
-           "cate_target_3" -> shape [B, S3, S3] (integer labels, -1=ignore) For P5 FPN level
-           "mask_target_3" -> shape [B, H, W, S3]  H and W equal to H and W for P2 FPN level
-
-        num_scales: number of FPN levels
-        num_classes: number of categories
+        class_outputs (Tensor):
+            Predicted class scores for each grid cell with shape `[B, sum(S_i^2), num_classes]`,
+            where `B` is the batch size, `S_i` is the grid size of corresponding FPN level, and `num_classes` is
+            the number of object categories (excluding background).
+        mask_outputs (Tensor):
+            Mask coefficient predictions for each grid cell, typically with shape `[B, sum(S_i^2), D]`,
+            where `S_i` varies per scale and `D` is the feature dimension.
+        mask_feat (Tensor):
+            Feature map used for mask generation, with shape `[B, H, W, D]`, where
+            `H` and `W` are spatial dimensions and `D` is the feature dimension.
+        class_target (Tensor):
+            Ground-truth class indices for each grid cell, with shape `[B, sum(S_i^2)]`.
+        mask_target (Tensor):
+            Ground-truth masks aligned to grid cells, with shape `[B, H, W, sum(S_i^2)]`.
+        num_classes (int):
+            Number of object classes (excluding background).
 
     Returns:
-       total_loss, total_cate_loss, total_mask_loss
+        Tuple[Tensor, Tensor, Tensor]:
+            A tuple containing:
+
+            - **total_loss** (`Tensor`): The combined total loss (classification + mask losses).
+            - **total_cate_loss** (`Tensor`): The classification (focal) loss component.
+            - **total_mask_loss** (`Tensor`): The mask (Dice) loss component.
+
+    Notes:
+        - This function assumes the SOLO (Segmenting Objects by Locations) architecture.
+        - The `mask_outputs` are used to linearly combine with `mask_feat` to produce
+          instance-specific mask predictions before applying the Dice loss.
+        - The classification loss is weighted more heavily (`cls_loss_weight=10`) to
+          stabilize training in early iterations.
     """
-    total_loss = tf.constant(0.0)
-    total_cate_loss = tf.constant(0.0)
-    total_mask_loss = tf.constant(0.0)
 
-    mask_feat_pred = outputs[2]  # [B, H, W, D]
+    class_true_one_hot = tf.one_hot(class_target + 1, depth=num_classes + 1, axis=-1)
+
+    mask_feat_flat = tf.reshape(mask_feat, [-1, tf.shape(mask_feat)[1] * tf.shape(mask_feat)[2],
+                                            tf.shape(mask_feat)[3]])  # [B, H*W, D]
     # batch size
-    B = tf.shape(mask_feat_pred)[0]
+    B = tf.shape(mask_feat)[0]
     # featuremap spatial dims
-    H, W = tf.shape(mask_feat_pred)[1], tf.shape(mask_feat_pred)[2]
-    # number of kernel weights
-    D = tf.shape(mask_feat_pred)[3]
+    H, W = tf.shape(mask_feat)[1], tf.shape(mask_feat)[2]
 
-    # Flatten mask_feat spatially: [B, H*W, D]
-    mask_feat_flat = tf.reshape(mask_feat_pred, [B, H * W, D])
+    #    mask_pred: [B, H*W, sum(S_i*S_i)]
+    mask_pred = tf.linalg.matmul(mask_feat_flat, mask_outputs, transpose_b=True)
+    mask_pred = tf.reshape(mask_pred, (B, H, W, tf.shape(mask_pred)[2]))  # [B, H, W, sum(S_i*S_i)]
 
-    for i in range(num_scales):
-        # --------------------------------------------------------------
-        # For Category Loss
-        # --------------------------------------------------------------
-        cate_pred = outputs[0][i]  # [B, S_i, S_i, num_classes]
-        cate_true = targets[f"cate_target_{i}"]  # [B, S_i, S_i]
-        cate_true = tf.one_hot(cate_true, depth=num_classes, axis=-1)
-
-        # --------------------------------------------------------------
-        # For Mask Loss
-        # --------------------------------------------------------------
-        mask_kernel_pred = outputs[1][i]  # [B, S_i, S_i, D]
-
-        # Flatten mask_kernel_pred over the grid to get [B, S_i, D]
-        mask_kernel_flat = tf.reshape(mask_kernel_pred, [B, -1, D])
-
-        # Dynamic conv: dot each kernel with every spatial feature
-        #    mask_pred: [B, H*W, N]
-        mask_pred = tf.linalg.matmul(mask_feat_flat, mask_kernel_flat, transpose_b=True)
-        mask_pred = tf.reshape(mask_pred, (B, H, W, tf.shape(mask_pred)[2]))    # [B, H, W, S_i]
-
-        mask_true = targets[f"mask_target_{i}"]  # [B, H_i, W_i, S_i]
-
-        # --------------------------------------------------------------
-        # Calculating SOLO Loss
-        # --------------------------------------------------------------
-        total_scale_loss, scale_cate_loss, scale_mask_loss = solo_loss(
-            cate_pred, mask_pred, cate_true, mask_true
-        )
-        total_loss += total_scale_loss
-        total_cate_loss += scale_cate_loss
-        total_mask_loss += scale_mask_loss
-
-    # Average across the number of scales
-    total_cate_loss /= num_scales
-    total_mask_loss /= num_scales
-    total_loss /= num_scales
+    # --------------------------------------------------------------
+    # Calculating SOLO Loss
+    # --------------------------------------------------------------
+    total_loss, total_cate_loss, total_mask_loss = solo_loss(
+        class_outputs, mask_pred, class_true_one_hot, mask_target, mask_loss_weight=1, cls_loss_weight=10
+    )
 
     return total_loss, total_cate_loss, total_mask_loss
