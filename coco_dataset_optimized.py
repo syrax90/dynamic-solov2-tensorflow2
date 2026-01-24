@@ -613,6 +613,8 @@ def parse_example(
     scales = tf.cast([scale_x, scale_y, scale_x, scale_y], dtype=tf.float32)
     bboxes = bboxes * scales  # element-wise broadcast
 
+    cat_ids = cat_ids - 1  # Convert to 0-based category ids
+
     def _generate_solo_targets_multi_scale(i, cate_acc, mask_acc):
         # enumerate i-th grid/scale_range
         grid_size_i = grid_sizes[i]

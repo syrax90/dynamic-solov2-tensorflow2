@@ -83,15 +83,15 @@ And you can find other intuitive parameters:
 
 ```
 # Image parameters
-self.img_height = 320
-self.img_width = 320
+self.img_height = 480
+self.img_width = 480
 
-# If load_previous_model = True: load the previous model weights (example: './weights/coco_epoch00001000.keras')
-self.load_previous_model = False
-self.lr = 0.0001
-self.batch_size = 8
-# If load_previous_model = True, you need to specify self.model_path to indicate which model to read the weights from to continue training.
-self.model_path = './weights/coco_epoch00000001.keras'
+# If load_previous_model = True: load the previous model weights
+self.load_previous_model = True
+self.lr = 0.001
+self.batch_size = 32
+# If load_previous_model = True, the code will look for the latest checkpoint in this directory or use this path if it is a specific checkpoint file.
+self.model_path = './checkpoints'    # example for specific checkpoint: self.model_path = './checkpoints/ckpt-5'
 
 # Save the model weights every save_iter epochs:
 self.save_iter = 1
@@ -105,7 +105,7 @@ To start training, run:
 python train.py
 ```
 
-Model weights are saved in the `weights` directory every `cfg.save_iter` epochs.
+Model weights and the optimizer state are saved in the `checkpoints` directory every `cfg.save_iter` epochs.
 
 To proceed training:
 
@@ -115,10 +115,10 @@ To proceed training:
 self.load_previous_model = True
 ```
 
-2) Set the path to the previously saved model:
+2) Set the path to a specific file if you want to load certain weights:
 
 ```
-self.model_path = './weights/coco_epoch00000001.keras'
+self.model_path = './checkpoints/ckpt-5'
 ```
 
 ## Testing
@@ -127,10 +127,10 @@ To test the model:
 
 1) Move your test images in the `/images/test` directory.
 
-2) In the config file, set the path to the model you want to test:
+2) In the config file, set the path to a specific file if you want to load certain weights:
 
 ```
-self.test_model_path = './weights/coco_epoch00000001.keras'
+self.test_model_path = './checkpoints/ckpt-5'
 ```
 
 3) Run the test script:

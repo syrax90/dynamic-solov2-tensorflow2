@@ -158,7 +158,6 @@ class MaskFeatureFusion(tf.keras.layers.Layer):
         self.conv_P3 = make_conv_block()
         self.conv_P2 = make_conv_block()
         # Convs after merging each level
-        self.merge_conv_P5 = ConvGNReLU(out_channels, kernel_size=3, groups=groups)
         self.merge_conv_P4 = ConvGNReLU(out_channels, kernel_size=3, groups=groups)
         self.merge_conv_P3 = ConvGNReLU(out_channels, kernel_size=3, groups=groups)
         self.merge_conv_P2 = ConvGNReLU(out_channels, kernel_size=3, groups=groups)
@@ -170,8 +169,7 @@ class MaskFeatureFusion(tf.keras.layers.Layer):
         if self.use_coord_conv:
             P5 = append_coord_channels(P5)
         # Process P5 and upsample to P4's size
-        P5_merged = self.merge_conv_P5(self.conv_P5(P5, training=training), training=training)
-        P5_upsampled = tf.image.resize(P5_merged, size=tf.shape(P4)[1:3], method='bilinear')
+        P5_upsampled = tf.image.resize(self.conv_P5(P5, training=training), size=tf.shape(P4)[1:3], method='bilinear')
         # Add to P4, then refine and upsample to P3's size
         P4_merged = self.merge_conv_P4(self.conv_P4(P4, training=training) + P5_upsampled, training=training)
         P4_upsampled = tf.image.resize(P4_merged, size=tf.shape(P3)[1:3], method='bilinear')
@@ -242,7 +240,9 @@ class DynamicSOLOHead(tf.keras.layers.Layer):
                 ], name=f'{name}_cls_block_{i}')
             )
 
-        self.cls_logits = tf.keras.layers.Conv2D(self.num_classes, kernel_size=1, padding='same', name=f'{name}_cls_logits')
+        prior_prob = 0.01
+        bias_value = -tf.math.log((1.0 - prior_prob) / prior_prob)
+        self.cls_logits = tf.keras.layers.Conv2D(self.num_classes, kernel_size=3, padding='same', name=f'{name}_cls_logits', bias_initializer=tf.keras.initializers.Constant(bias_value))
 
         # ----------------------------------------------------------------------
         # Mask branch

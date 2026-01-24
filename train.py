@@ -289,32 +289,37 @@ if __name__ == '__main__':
     batch_size = cfg.batch_size
     img_height, img_width = cfg.img_height, cfg.img_width
 
-    previous_epoch = 0
-    # load previous model if load_previous_model = True
-    load_previous_model = cfg.load_previous_model
-    if load_previous_model:
-        # Create a model instance because of NGC's TensorFlow version
-        solo_model = SOLOModel(
-            input_shape=(img_height, img_width, 3),  # Example shape
-            num_classes=num_classes,
-            num_stacked_convs=7,
-            head_input_channels=256,
-            mask_kernel_channels=256,
-            grid_sizes=cfg.grid_sizes
-        )
-        solo_model.build((None, img_height, img_width, 3))
-        solo_model.load_weights(cfg.model_path)
-        previous_epoch = extract_epoch_number(cfg.model_path)
+    solo_model = SOLOModel(
+        input_shape=(img_height, img_width, 3),  # Example shape
+        num_classes=num_classes,
+        num_stacked_convs=7,
+        head_input_channels=256,
+        mask_kernel_channels=256,
+        grid_sizes=cfg.grid_sizes
+    )
+    solo_model.build((None, img_height, img_width, 3))
+
+    optimizer = tf.keras.optimizers.SGD(learning_rate=cfg.lr, momentum=0.9)
+
+    # Checkpoint mechanism
+    epoch_var = tf.Variable(0, trainable=False, dtype=tf.int64)
+    checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=solo_model, epoch=epoch_var)
+    manager = tf.train.CheckpointManager(checkpoint, directory='./checkpoints', max_to_keep=10)
+
+    if cfg.load_previous_model:
+        checkpoint_path = cfg.model_path
+        if os.path.isdir(checkpoint_path):
+            checkpoint_path = tf.train.latest_checkpoint(checkpoint_path)
+
+        if checkpoint_path:
+            checkpoint.restore(checkpoint_path).expect_partial()
+            print(f"Restored from {checkpoint_path}")
+        else:
+            raise FileNotFoundError(f"Load previous model is True but no checkpoint found in {cfg.model_path}")
     else:
-        solo_model = SOLOModel(
-            input_shape=(img_height, img_width, 3),  # Example shape
-            num_classes=num_classes,
-            num_stacked_convs=7,
-            head_input_channels=256,
-            mask_kernel_channels=256,
-            grid_sizes=cfg.grid_sizes
-        )
-        solo_model.build((None, img_height, img_width, 3))
+        print("Starting from scratch.")
+
+    previous_epoch = int(epoch_var.numpy())
 
     if previous_epoch > cfg.epochs:
         print(f'The model is trained {previous_epoch} epochs already while configuration assumes {cfg.epochs} epochs.')
@@ -343,30 +348,19 @@ if __name__ == '__main__':
             augment=cfg.augment
         )
 
-    optimizer = tf.keras.optimizers.SGD(learning_rate=cfg.lr, momentum=0.9)
-
     # Training loop
     print("Starting training...")
-    for epoch in range(previous_epoch + 1, cfg.epochs):
+    for epoch in range(previous_epoch + 1, cfg.epochs + 1):
         print(f"Starting epoch {epoch}:")
         if cfg.use_gradient_accumulation_steps:
             run_one_epoch_accumulated_mode(solo_model, ds, optimizer, num_classes, accumulation_steps=cfg.accumulation_steps)
         else:
             train_one_epoch(solo_model, ds, optimizer, num_classes)
-        # ==================== save ====================
-        if epoch != 0 and epoch % cfg.save_iter == 0:
-            save_path = f'./weights/{cfg.model_weights_prefix}_epoch%.8d.keras' % epoch
-            solo_model.save(save_path)
-            path_dir = os.listdir('./weights')
-            epoch_numbers = []
-            names = []
-            for name in path_dir:
-                if name.endswith('.keras') and name.startswith(cfg.model_weights_prefix):
-                    epoch_number = extract_epoch_number(name)
-                    epoch_numbers.append(epoch_number)
-                    names.append(name)
-            if len(epoch_numbers) > 10:
-                i = epoch_numbers.index(min(epoch_numbers))
-                os.remove('./weights/' + names[i])
-            logger.info('Save model to {}'.format(save_path))
+
+        # Update epoch variable
+        epoch_var.assign(epoch)
+
+        if epoch % cfg.save_iter == 0:
+            save_path = manager.save()
+            logger.info('Saved checkpoint for epoch {}: {}'.format(epoch, save_path))
     print("Done!")

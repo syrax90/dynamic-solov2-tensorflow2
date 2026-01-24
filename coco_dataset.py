@@ -159,7 +159,7 @@ def generate_solo_targets_single_scale(
 
     # Loop over annotations
     for idx, ann in enumerate(anns):
-        cat_id = ann['category_id']
+        cat_id = ann['category_id'] -1 # Convert to 0-based category ids
         seg_mask_original = resized_masks[idx]  # (img_h, img_w)
         x, y, w, h = resized_bboxes[idx]             # bounding box in original image coords
 
