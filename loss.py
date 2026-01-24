@@ -9,21 +9,19 @@ import tensorflow as tf
 
 
 def focal_loss(
-        logits,   # [B, H, W, C]
-        targets,  # [B, H, W, C] one-hot
-        alpha=None,   # per-class weight for positives and negatives
-        gamma=2.0,
-        eps=1e-7
+        logits,   # [B, sum(S_i^2), C]
+        targets,  # [B, sum(S_i^2), C] one-hot
+        alpha=None,   # per-class weights
+        gamma=2.0
 ):
     """
     Softmax focal loss with explicit penalty for false positives (non-target classes).
 
     Args:
-        logits:  [B, H, W, C] unnormalized scores.
-        targets: [B, H, W, C] one-hot (exactly one 1 per pixel).
-        alpha:   per-class weighting for positives and negatives. If None, uses [0.001 for background, 0.75 for others].
+        logits:  [B, sum(S_i^2), C] unnormalized scores.
+        targets: [B, sum(S_i^2), C] one-hot (exactly one 1 per pixel).
+        alpha:   per-class weights. If None, uses [0.75 for background, 0.25 for others].
         gamma:   focusing parameter.
-        eps:     numerical stability for logs.
 
     Returns:
         Scalar Tensor (mean loss).
@@ -32,28 +30,27 @@ def focal_loss(
 
     # Default alpha: emphasize foreground vs background
     if alpha is None:
-        alpha = [0.001] + [0.75] * (num_classes - 1)
+        alpha = [0.75] + [0.25] * (num_classes - 1)
     alpha = tf.constant(alpha, dtype=logits.dtype)  # [C]
-    alpha = tf.cast(alpha, logits.dtype)        # positives
+    alpha = tf.cast(alpha, logits.dtype)  # positives
 
     # Softmax probabilities
-    probs = tf.nn.softmax(logits, axis=-1)                 # [B,H,W,C]
-    probs = tf.clip_by_value(probs, eps, 1.0 - eps)
-    log_probs   = tf.math.log(probs)                       # [B,H,W,C]
-    log1m_probs = tf.math.log1p(-probs)                    # [B,H,W,C]
+    log_probs = tf.nn.log_softmax(logits, axis=-1)
+    probs = tf.exp(log_probs)
 
-    # Positive (true-class) focal term: -alpha * (1 - p)^gamma * log(p)
+    # Focal term: -alpha * (1 - p)^gamma * log(p) * target
     pos_weight = tf.pow(1.0 - probs, gamma)
-    pos_term = -targets * alpha * pos_weight * log_probs
+    focal_term = -targets * alpha * pos_weight * log_probs
 
-    # Negative (non-true-class) focal term (penalizes false positives):
-    # For each non-target class k: -alpha * p_k^gamma * log(1 - p_k)
-    neg_weight = tf.pow(probs, gamma)
-    neg_term = -(1.0 - targets) * alpha * neg_weight * log1m_probs
+    # Sum the loss over all dimensions (Batch, Spatial, Class)
+    total_loss = tf.reduce_sum(focal_term)
 
-    # Sum over classes, then mean over batch/spatial dims
-    loss = tf.reduce_sum(pos_term + neg_term, axis=-1)     # [B,H,W]
-    return tf.reduce_mean(loss)
+    # Calculate the number of foreground pixels.
+    foreground_targets = targets[..., 1:]
+    num_foreground = tf.reduce_sum(foreground_targets)
+    num_foreground = tf.cast(num_foreground, dtype=tf.float32)
+
+    return total_loss / tf.maximum(num_foreground, 1.0)
 
 
 def dice_loss(pred_mask, gt_mask, cls_target, eps=1e-5):
@@ -72,8 +69,7 @@ def dice_loss(pred_mask, gt_mask, cls_target, eps=1e-5):
     """
     # Convert cls_target to positive mask [B, S^2]
     # If it's one-hot, sum across classes → positive cell indicator
-    pos_mask = tf.reduce_sum(cls_target, axis=-1)  # [B, S, S]
-    pos_mask = tf.reshape(pos_mask, [tf.shape(pos_mask)[0], -1])  # [B, S^2]
+    pos_mask = tf.reduce_sum(cls_target, axis=-1)  # [B, S^2]
 
     # Flatten masks for batch processing
     pred_mask = tf.reshape(pred_mask, [tf.shape(pred_mask)[0], -1, tf.shape(pred_mask)[-1]])  # [B, HW, S^2]
@@ -106,8 +102,8 @@ def solo_loss(
         mask_pred,  # [B, H, W, sum(S_i^2)]
         cls_target,  # [B, sum(S_i^2), num_classes]
         gt_masks_for_cells,  # [B, H, W, sum(S_i^2)]
-        cls_loss_weight=1,
-        mask_loss_weight=1,
+        cls_loss_weight=3,
+        mask_loss_weight=5,
 ):
     """
     Computes the SOLO loss for a single scale, combining classification and mask prediction losses.
@@ -129,7 +125,7 @@ def solo_loss(
             - mask_loss_value (Tensor): The mask prediction loss component.
     """
     # Classification loss
-    cls_loss_value = focal_loss(cls_pred, cls_target)
+    cls_loss_value = focal_loss(cls_pred, cls_target, alpha=0.5)
 
     mask_probs = tf.nn.sigmoid(mask_pred)
 
@@ -139,7 +135,6 @@ def solo_loss(
     cls_target_no_bg = cls_target[..., 1:]  # Exclude background class
     mask_loss_value = dice_loss(mask_probs, gt_masks_valid, cls_target_no_bg)
 
-    # Decrease mask_loss_value to train it faster
     total_loss = cls_loss_weight * cls_loss_value + mask_loss_weight * mask_loss_value
     return total_loss, cls_loss_value, mask_loss_value
 
@@ -185,8 +180,12 @@ def compute_multiscale_loss(class_outputs, mask_outputs, mask_feat, class_target
         - The classification loss is weighted more heavily (`cls_loss_weight=10`) to
           stabilize training in early iterations.
     """
+    # Boolean mask for invalid classes
+    invalid_cls_mask = class_target >= num_classes  # shape [B, N]
 
-    class_true_one_hot = tf.one_hot(class_target + 1, depth=num_classes + 1, axis=-1)
+    # Replace all values >= num_classes with -1
+    class_target_no_excess = tf.where(invalid_cls_mask, -1, class_target)
+    class_true_one_hot = tf.one_hot(class_target_no_excess + 1, depth=num_classes + 1, axis=-1)
 
     mask_feat_flat = tf.reshape(mask_feat, [-1, tf.shape(mask_feat)[1] * tf.shape(mask_feat)[2],
                                             tf.shape(mask_feat)[3]])  # [B, H*W, D]
@@ -203,7 +202,7 @@ def compute_multiscale_loss(class_outputs, mask_outputs, mask_feat, class_target
     # Calculating SOLO Loss
     # --------------------------------------------------------------
     total_loss, total_cate_loss, total_mask_loss = solo_loss(
-        class_outputs, mask_pred, class_true_one_hot, mask_target, mask_loss_weight=1, cls_loss_weight=10
+        class_outputs, mask_pred, class_true_one_hot, mask_target
     )
 
     return total_loss, total_cate_loss, total_mask_loss

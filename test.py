@@ -395,7 +395,7 @@ if __name__ == '__main__':
     coco = COCO(cfg.train_annotation_path)
     categories = coco.loadCats(coco.getCatIds())
     # Create dictionary: {category_id: category_name}
-    coco_classes = {cat['id']: cat['name'] for cat in categories}
+    coco_classes = {cat['id'] - 1: cat['name'] for cat in categories}
 
     # Workaround because of NGC's TensorFlow version
     class_names = get_classes(cfg.classes_path)
@@ -410,7 +410,18 @@ if __name__ == '__main__':
         grid_sizes=cfg.grid_sizes
     )
     solo.build((None, img_height, img_width, 3))
-    solo.load_weights(model_path)
+
+    checkpoint = tf.train.Checkpoint(model=solo)
+    # Check if model_path is a directory (default CheckpointManager dir) or specific file
+    checkpoint_path = model_path
+    if os.path.isdir(checkpoint_path):
+        checkpoint_path = tf.train.latest_checkpoint(checkpoint_path)
+
+    if checkpoint_path:
+        checkpoint.restore(checkpoint_path).expect_partial()
+        print(f"Restored from {checkpoint_path}")
+    else:
+        raise FileNotFoundError(f"Load previous model is True but no checkpoint found in {model_path}")
 
     if not os.path.exists('images/res/'): os.mkdir('images/res/')
     path_dir = os.listdir('images/test')
