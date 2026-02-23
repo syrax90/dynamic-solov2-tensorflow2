@@ -1,6 +1,7 @@
 # Dynamic SOLO (SOLOv2) with TensorFlow
 
 This project is an implementation of <strong>Dynamic SOLO (SOLOv2)</strong> using the TensorFlow framework. The goal is to provide a clear explanation of how Dynamic SOLO works and demonstrate how the model can be implemented with TensorFlow.  
+[SOLOv2 Tensorflow](https://github.com/syrax90/dynamic-solov2-tensorflow2)
 
 ## About SOLO
 
